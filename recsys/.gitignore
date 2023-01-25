@@ -1,0 +1,7 @@
+*.png
+*.parquet
+*.lance
+*.csv
+.ipynb_checkpoints
+.metaflow
+README.txt

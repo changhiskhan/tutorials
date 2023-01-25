@@ -20,7 +20,9 @@ class DataFlow(FlowSpec):
         training our Recommender System.
         """
         import duckdb
+        import lance
         import numpy as np
+        base_table = lance.dataset('cleaned_spotify_dataset.lance').to_table()
         # highlight-next-line
         con = duckdb.connect(database=':memory:')
         # highlight-start
@@ -29,7 +31,7 @@ class DataFlow(FlowSpec):
             SELECT *, 
             CONCAT (user_id, '-', playlist) as playlist_id,
             CONCAT (artist, '|||', track) as track_id,
-            FROM 'cleaned_spotify_dataset.parquet'
+            FROM base_table
             ;
         """)
         # highlight-end

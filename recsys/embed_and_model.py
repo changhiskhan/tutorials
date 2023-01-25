@@ -38,14 +38,16 @@ class RecModelTrainingFlow(FlowSpec):
         training our Recommender System.
         """
         import duckdb
+        import lance
         import numpy as np
+        base_table = lance.dataset('cleaned_spotify_dataset.lance').to_table()
         con = duckdb.connect(database=':memory:')
         con.execute("""
             CREATE TABLE playlists AS 
             SELECT *, 
             CONCAT (user_id, '-', playlist) as playlist_id,
             CONCAT (artist, '|||', track) as track_id,
-            FROM 'cleaned_spotify_dataset.parquet'
+            FROM base_table
             ;
         """)
         con.execute("SELECT * FROM playlists LIMIT 1;")

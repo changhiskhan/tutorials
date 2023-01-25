@@ -5,7 +5,10 @@ to get a clean CSV we can import in the Flow using duckdb.
 
 """
 
+import lance
 import pandas as pd
+import pyarrow as pa
+
 import random
 
 
@@ -24,10 +27,13 @@ def clean_dataset():
     df_playlist.insert(0, 'row_id', range(0, len(df_playlist)))
     # show the df
     print(df_playlist.head())
-    # print the final lenght for the df befo
+    # print the final length for the df before writing to disk
     print("Total rows: {}".format(len(df_playlist)))
     # dump to parquet (better than csv for duckdb)
+
     df_playlist.to_parquet('cleaned_spotify_dataset.parquet')
+    lance.write_dataset(pa.Table.from_pandas(df_playlist), "cleaned_spotify_dataset.lance")
+
     print("All done\n\nSee you, space cowboy\n")
 
     return
