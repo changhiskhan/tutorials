@@ -2,8 +2,12 @@
 # global imports
 from metaflow import FlowSpec, step, S3, Parameter, current, card
 from metaflow.cards import Markdown, Table
+import lance
+import numpy as np
 import os
 import json
+import pyarrow as pa
+import shutil
 import time
 from random import choice
 
@@ -258,6 +262,22 @@ class RecSysSagemakerDeployment(FlowSpec):
         # join with the other runs
         self.next(self.join_runs)
 
+    def write_vectors(self, vector_space):
+        emb_type = pa.list_(pa.float32(), list_size=48)
+        schema = pa.schema([pa.field("track", pa.string(), False),
+                            pa.field("embedding", emb_type, False)])
+        vectors = vector_space.vectors / np.sqrt((vector_space.vectors ** 2).sum(axis=1))[:, None]
+        tbl = pa.Table.from_arrays([pa.array(vector_space.index_to_key),
+                                    pa.FixedSizeListArray.from_arrays(
+                                        pa.array(vectors.ravel(), type=pa.float32()),
+                                        list_size=48)
+                                    ],
+                                   schema=schema)
+        uri = "embeddings.lance"
+        shutil.rmtree(uri)
+        lance.write_dataset(tbl, uri)
+        return lance.dataset(uri)
+
     @card(type='blank', id='hyperCard')
     @step
     def join_runs(self, inputs):
@@ -282,6 +302,8 @@ class RecSysSagemakerDeployment(FlowSpec):
                 [inp.hyper_string, inp.validation_metric] for inp in inputs
             ])
         )
+        # write vectors to disk
+        self.write_vectors(self.final_vectors)
         # next, test the best model on unseen data, and report the final Hit Rate as 
         # our best point-wise estimate of "in the wild" performance
         self.next(self.model_testing)
@@ -303,60 +325,6 @@ class RecSysSagemakerDeployment(FlowSpec):
         print("Hit Rate@{} on the test set is: {}".format(self.KNN_K, self.test_metric))
         self.next(self.deploy)
 
-    # highlight-start
-    def keras_model(
-        self,
-        all_ids: list,
-        song_vectors, # np array with vectors
-        test_id: str,
-        test_vector
-        ):
-    # highlight-end
-        """
-        Build a retrieval model using TF recommender abstraction - by packaging the vector space
-        in a Keras object, we get for free the possibility of shipping the artifact "as is" to 
-        a Sagemaker endpoint, and benefit from the PaaS abstraction and hardware acceleration.
-
-        Of course, other deployment options are possible, including for example using a custom script
-        and a custom image with Sagemaker.
-        """
-        import tensorflow as tf
-        import tensorflow_recommenders as tfrs
-        import numpy as np
-        embedding_dimension = song_vectors[0].shape[0]
-        print("Vector space dims: {}".format(embedding_dimension))
-        # add to the existing matrix of weight a 0.0.0.0... vector for unknown items
-        unknown_vector = np.zeros((1, embedding_dimension))
-        print(song_vectors.shape, unknown_vector.shape)
-        embedding_matrix = np.r_[unknown_vector, song_vectors]
-        # first item is the unknown token!
-        print(embedding_matrix.shape)
-        assert embedding_matrix[0][0] == 0.0
-        # init embedding layer with our vectors
-        embedding_layer = tf.keras.layers.Embedding(len(all_ids) + 1, embedding_dimension)
-        embedding_layer.build((None, ))
-        embedding_layer.set_weights([embedding_matrix])
-        embedding_layer.trainable = False
-        vector_model = tf.keras.Sequential([
-            tf.keras.layers.StringLookup(vocabulary=all_ids, mask_token=None),
-            embedding_layer
-            ])
-        _v = vector_model(np.array([test_id]))
-        # debug
-        print(test_vector[:3])
-        print(_v[0][:3])
-        # test unknonw ID
-        print("Test unknown id:")
-        print(vector_model(np.array(['blahdagkagda']))[0][:3])    
-        # Finally, create a retrieval model
-        song_index = tfrs.layers.factorized_top_k.BruteForce(vector_model)  
-        song_index.index(song_vectors, np.array(all_ids))
-        # Try it
-        _, names = song_index(tf.constant([test_id]))
-        print(f"Recommendations after track '{test_id}': {names[0, :3]}")
-
-        return song_index
-
     # highlight-next-line
     def build_retrieval_model(self):
         """
@@ -366,35 +334,18 @@ class RecSysSagemakerDeployment(FlowSpec):
         While for simplicity this function is embedded in the deploy step,
         you could think of spinning it out as it's own step.
         """
-        import tarfile
-        # generate a signature for the endpointand timestamp as a convention
-        self.model_timestamp = int(round(time.time() * 1000))
-        # save model: TF models need to have a version: https://github.com/aws/sagemaker-python-sdk/issues/1484
-        model_name = "playlist-recs-model-{}/1".format(self.model_timestamp )
-        local_tar_name = 'model-{}.tar.gz'.format(self.model_timestamp)
-        # pick one item, as index, to use as a test
-        self.test_index = 3
-        retrieval_model = self.keras_model(
-            self.all_ids,
-            self.startup_embeddings,
-            self.all_ids[self.test_index],
-            self.startup_embeddings[self.test_index]
-        )
-        retrieval_model.save(filepath=model_name)
-        # zip keras folder to a single tar local file
-        with tarfile.open(local_tar_name, mode="w:gz") as _tar:
-            _tar.add(model_name, recursive=True)
-        # metaflow nice s3 client needs a byte object for the put ;-)
-        with open(local_tar_name, "rb") as in_file:
-            data = in_file.read()
-            # highlight-start
-            with S3(run=self) as s3:
-                url = s3.put(local_tar_name, data)
-                # print it out for debug purposes
-                print("Model saved at: {}".format(url))
-                # save this path for reference!
-                return url
-            # highlight-end
+        dataset = lance.dataset("embeddings.lance")
+        df = dataset.to_table().to_pandas()
+        vectable = zip(*[s.values() for s in list(df.to_dict().values())])
+        lookup = {track: embedding for track, embedding in vectable}
+
+        def find_topk(track, k=10):
+            q = lookup[track]
+            return dataset.to_table(nearest={
+                "column": "embedding", "q": q, "k": k
+            })
+        return find_topk
+
 
     # highlight-start
     @step
@@ -417,34 +368,16 @@ class RecSysSagemakerDeployment(FlowSpec):
         if self.SAGEMAKER_DEPLOY == '0':
             print("Skipping deployment to Sagemaker")
         else:
-            # first build the retrieval model and version it on S3
-            self.model_s3_path = self.build_retrieval_model()
-            from sagemaker.tensorflow import TensorFlowModel
-            self.ENDPOINT_NAME = 'playlist-recs-{}-endpoint'.format(self.model_timestamp)
-            # print out the name, so that we can use it later
-            print("\n\n================\nEndpoint name is: {}\n\n".format(self.ENDPOINT_NAME))
-            model = TensorFlowModel(
-                model_data=self.model_s3_path,
-                image_uri=self.SAGEMAKER_IMAGE,
-                role=self.SAGEMAKER_ROLE
-            )
-            predictor = model.deploy(
-                initial_instance_count=1,
-                instance_type=self.SAGEMAKER_INSTANCE,
-                endpoint_name=self.ENDPOINT_NAME
-            )
+            predictor = self.build_retrieval_model()
             # run a small test against the endpoint to check everything is working fine
-            input = {'instances': np.array([self.all_ids[self.test_index]])}
+            input = self.all_ids[self.test_index]
             # output is on the form {'predictions': {'output_2': ['0012E00001z5EzAQAU', ..]}
-            result = predictor.predict(input)
-            print(input, result)
-            # delete the endpoint to avoid wasteful computing, as Sagemaker can be expensive!
-            # NOTE: comment this if you want to keep it running
-            # If deletion fails, make sure you delete the model in the console!
-            print("Deleting endpoint now...")
-            predictor.delete_endpoint()
-            print("Endpoint deleted!")
-        
+            import time
+            start = time.time()
+            result = predictor(input)
+            end = time.time()
+            print(input, result, end - start)
+
         self.next(self.end)
 
     @step

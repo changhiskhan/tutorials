@@ -22,6 +22,9 @@ class DataFlow(FlowSpec):
         import duckdb
         import lance
         import numpy as np
+        # TODO once https://github.com/duckdb/duckdb/pull/5998 is merged and released
+        #      we no longer need to read it out into a table first
+        #      long term plan is to release a duckdb extension for lance as well
         base_table = lance.dataset('cleaned_spotify_dataset.lance').to_table()
         # highlight-next-line
         con = duckdb.connect(database=':memory:')

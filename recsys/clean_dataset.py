@@ -32,7 +32,14 @@ def clean_dataset():
     # dump to parquet (better than csv for duckdb)
 
     df_playlist.to_parquet('cleaned_spotify_dataset.parquet')
-    lance.write_dataset(pa.Table.from_pandas(df_playlist), "cleaned_spotify_dataset.lance")
+
+    # TODO we can make this shorter and add a pandas accessor like df.lance.write("dataset.lance")
+    # df_playlist['playlist'] = df_playlist['playlist'].astype('category')
+    # df_playlist['track'] = df_playlist['track'].astype('category')
+    # df_playlist['artist'] = df_playlist['artist'].astype('category')
+    # df_playlist['user_id'] = df_playlist['user_id'].astype('category')
+    tbl = pa.Table.from_pandas(df_playlist)
+    lance.write_dataset(tbl, "cleaned_spotify_dataset.lance")
 
     print("All done\n\nSee you, space cowboy\n")
 

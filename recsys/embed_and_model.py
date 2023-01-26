@@ -1,25 +1,29 @@
+import numpy as np
 from metaflow import FlowSpec, step, S3, Parameter, current
 import os
 import json
+import lance
+import pyarrow as pa
+import shutil
 import time
 from random import choice
 
 
 class RecModelTrainingFlow(FlowSpec):
-
     IS_DEV = Parameter(
         name='is_dev',
         help='Flag for dev development, with a smaller dataset',
         default='1'
     )
 
-    #highlight-start
+    # highlight-start
     KNN_K = Parameter(
         name='knn_k',
         help='Number of neighbors we retrieve from the vector space',
         default='100'
-    ) 
-    #highlight-end
+    )
+
+    # highlight-end
 
     @step
     def start(self):
@@ -52,17 +56,17 @@ class RecModelTrainingFlow(FlowSpec):
         """)
         con.execute("SELECT * FROM playlists LIMIT 1;")
         print(con.fetchone())
-        
+
         tables = ['row_id', 'user_id', 'track_id', 'playlist_id', 'artist']
         for t in tables:
             con.execute("SELECT COUNT(DISTINCT({})) FROM playlists;".format(t))
             print("# of {}".format(t), con.fetchone()[0])
-            
+
         sampling_cmd = ''
         if self.IS_DEV == '1':
             print("Subsampling data, since this is DEV")
             sampling_cmd = ' USING SAMPLE 10 PERCENT (bernoulli)'
-            
+
         dataset_query = """
             SELECT * FROM
             (   
@@ -80,7 +84,7 @@ class RecModelTrainingFlow(FlowSpec):
             {}
             ;
             """.format(sampling_cmd)
-        
+
         con.execute(dataset_query)
         df = con.fetch_df()
         print("# rows: {}".format(len(df)))
@@ -88,25 +92,25 @@ class RecModelTrainingFlow(FlowSpec):
         con.close()
 
         train, validate, test = np.split(
-            df.sample(frac=1, random_state=42), 
+            df.sample(frac=1, random_state=42),
             [int(.7 * len(df)), int(.9 * len(df))])
-        
+
         self.df_dataset = df
         self.df_train = train
         self.df_validate = validate
         self.df_test = test
         print("# testing rows: {}".format(len(self.df_test)))
-        
-        self.hyper_string = json.dumps({ 
-            'min_count': 3, 
-            'epochs': 30, 
-            'vector_size': 48, 
+
+        self.hyper_string = json.dumps({
+            'min_count': 3,
+            'epochs': 30,
+            'vector_size': 48,
             'window': 10,
-            'ns_exponent': 0.75 })
-        
+            'ns_exponent': 0.75})
+
         self.next(self.generate_embeddings)
 
-    #highlight-next-line
+    # highlight-next-line
     def predict_next_track(self, vector_space, input_sequence, k):
         """        
         Given an embedding space, predict best next song with KNN.
@@ -122,12 +126,13 @@ class RecModelTrainingFlow(FlowSpec):
         https://dl.acm.org/doi/10.1145/3383313.3411477
         """
         query_item = input_sequence[-1]
+
         if query_item not in vector_space:
             query_item = choice(list(vector_space.index_to_key))
-        
+
         return [_[0] for _ in vector_space.most_similar(query_item, topn=k)]
 
-    #highlight-next-line
+    # highlight-next-line
     def evaluate_model(self, _df, vector_space, k):
         lambda_predict = lambda row: self.predict_next_track(vector_space, row['track_test_x'], k)
         _df['predictions'] = _df.apply(lambda_predict, axis=1)
@@ -136,10 +141,10 @@ class RecModelTrainingFlow(FlowSpec):
         hit_rate = _df['hit'].sum() / len(_df)
         return hit_rate
 
-    #highlight-start
+    # highlight-start
     @step
     def generate_embeddings(self):
-    #highlight-end
+        # highlight-end
         """
         Generate vector representations for songs, based on the Prod2Vec idea.
 
@@ -162,13 +167,30 @@ class RecModelTrainingFlow(FlowSpec):
             track2vec_model.wv,
             k=int(self.KNN_K))
         print("Hit Rate@{} is: {}".format(self.KNN_K, self.validation_metric))
-        self.track_vectors = track2vec_model.wv
+        self.tracked_vectors = track2vec_model.wv
+        self.write_vectors(track2vec_model.wv)
         self.next(self.model_testing)
 
-    #highlight-start
+    def write_vectors(self, vector_space):
+        emb_type = pa.list_(pa.float32(), list_size=48)
+        schema = pa.schema([pa.field("track", pa.string(), False),
+                            pa.field("embedding", emb_type, False)])
+        vectors = vector_space.vectors / np.sqrt((vector_space.vectors ** 2).sum(axis=1))[:, None]
+        tbl = pa.Table.from_arrays([pa.array(vector_space.index_to_key),
+                                    pa.FixedSizeListArray.from_arrays(
+                                        pa.array(vectors.ravel(), type=pa.float32()),
+                                        list_size=48)
+                                    ],
+                                   schema=schema)
+        uri = "embeddings.lance"
+        shutil.rmtree(uri)
+        lance.write_dataset(tbl, uri)
+        return lance.dataset(uri)
+
+    # highlight-start
     @step
     def model_testing(self):
-    #highlight-end
+        # highlight-end
         """
         Test the generalization abilities of the best model by running predictions
         on the unseen test data.
@@ -177,16 +199,14 @@ class RecModelTrainingFlow(FlowSpec):
         evaluating recommender systems is a very complex task, and better metrics, through good abstractions, 
         are available, i.e. https://reclist.io/.
         """
-        self.test_metric = self.evaluate_model(
-            self.df_test,
-            self.track_vectors,
-            k=int(self.KNN_K))
+        self.test_metric = self.evaluate_model(self.df_test, self.tracked_vectors, k=int(self.KNN_K))
         print("Hit Rate@{} on the test set is: {}".format(self.KNN_K, self.test_metric))
         self.next(self.end)
 
     @step
     def end(self):
         pass
+
 
 if __name__ == '__main__':
     RecModelTrainingFlow()
