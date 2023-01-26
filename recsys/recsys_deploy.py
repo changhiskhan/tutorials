@@ -364,19 +364,16 @@ class RecSysSagemakerDeployment(FlowSpec):
         import numpy as np
         self.all_ids = list(self.final_vectors.index_to_key)
         self.startup_embeddings = np.array([self.final_vectors[_] for _ in self.all_ids])
-        # skip the deployment if not needed
-        if self.SAGEMAKER_DEPLOY == '0':
-            print("Skipping deployment to Sagemaker")
-        else:
-            predictor = self.build_retrieval_model()
-            # run a small test against the endpoint to check everything is working fine
-            input = self.all_ids[self.test_index]
-            # output is on the form {'predictions': {'output_2': ['0012E00001z5EzAQAU', ..]}
-            import time
-            start = time.time()
-            result = predictor(input)
-            end = time.time()
-            print(input, result, end - start)
+        predictor = self.build_retrieval_model()
+        # run a small test against the endpoint to check everything is working fine
+        self.test_index = 3
+        input = self.all_ids[self.test_index]
+        # output is on the form {'predictions': {'output_2': ['0012E00001z5EzAQAU', ..]}
+        import time
+        start = time.time()
+        result = predictor(input)
+        end = time.time()
+        print("deploy test", input, result, end - start)
 
         self.next(self.end)
 
